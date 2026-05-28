@@ -1,14 +1,16 @@
 {
-  "name": "tg-wallet-bot",
-  "version": "1.0.0",
-  "description": "Telegram bot + WebSocket for live NFT config",
+  "name": "telegram-cdn-bot",
+  "version": "2.0.0",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.14.2",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "basic-ftp": "^5.0.4",
+    "adm-zip": "^0.5.10",
+    "axios": "^1.6.2",
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.3.1"
   }
 }

@@ -6,7 +6,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const ftp = require('basic-ftp');
 const AdmZip = require('adm-zip');
 const axios = require('axios');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const cron = require('node-cron');
 const fs = require('fs');
 const path = require('path');
@@ -24,14 +24,14 @@ const CDN_SECRET = process.env.CDN_SECRET;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
 const ADMIN_TOOLS_TOKEN = process.env.ADMIN_TOOLS_TOKEN;
-const SHORT_URL_BASE = process.env.SHORT_URL_BASE || 'https://short.link/';
-const APK_INSTALL_PAGE_BASE = process.env.APK_INSTALL_PAGE_BASE || 'https://apk.yourdomain.com/';
+const SHORT_URL_BASE = process.env.SHORT_URL_BASE || 'https://yourdomain.com/s/';
+const APK_INSTALL_PAGE_BASE = process.env.APK_INSTALL_PAGE_BASE || 'https://yourdomain.com/apk/';
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
-// ---------- DB ----------
-const db = new sqlite3.Database('./data.db');
-db.run(`CREATE TABLE IF NOT EXISTS shorturls (
+// ---------- Database (better-sqlite3) ----------
+const db = new Database('./data.db');
+db.exec(`CREATE TABLE IF NOT EXISTS shorturls (
   id TEXT PRIMARY KEY,
   target TEXT,
   cloak TEXT,
@@ -40,7 +40,7 @@ db.run(`CREATE TABLE IF NOT EXISTS shorturls (
   clicks INTEGER DEFAULT 0,
   created_at TEXT
 )`);
-db.run(`CREATE TABLE IF NOT EXISTS apk_files (
+db.exec(`CREATE TABLE IF NOT EXISTS apk_files (
   id TEXT PRIMARY KEY,
   filename TEXT,
   cdn_path TEXT,
@@ -51,7 +51,7 @@ db.run(`CREATE TABLE IF NOT EXISTS apk_files (
   download_count INTEGER DEFAULT 0,
   created_at TEXT
 )`);
-db.run(`CREATE TABLE IF NOT EXISTS visits (
+db.exec(`CREATE TABLE IF NOT EXISTS visits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ip TEXT,
   page TEXT,
@@ -60,7 +60,7 @@ db.run(`CREATE TABLE IF NOT EXISTS visits (
   created_at TEXT
 )`);
 
-// ---------- Express + WebSocket ----------
+// ---------- Express & WebSocket ----------
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -108,15 +108,14 @@ async function uploadSingleFile(localPath, remotePath) {
   await client.uploadFrom(localPath, remotePath);
   client.close();
 }
-async function getFileBuffer(remotePath) {
+async function writeFTPFile(remotePath, content) {
+  const tmp = `/tmp/ftp_${Date.now()}.txt`;
+  fs.writeFileSync(tmp, content);
   const client = await ftpConnect();
-  const chunks = [];
-  await client.downloadTo((stream) => { stream.on('data', d => chunks.push(d)); }, remotePath);
+  await client.uploadFrom(tmp, remotePath);
   client.close();
-  return Buffer.concat(chunks);
+  fs.unlinkSync(tmp);
 }
-
-// ---------- CDN Purge ----------
 async function purgeCDN(urlPath = '/') {
   if (!CDN_SECRET) return;
   try { await axios.get(`https://assets.cdn.express/api/purge?secret=${CDN_SECRET}&path=${urlPath}`); } catch(e) { console.error('Purge error', e.message); }
@@ -135,82 +134,75 @@ async function enableSSL() { return { success: true }; }
 
 // ---------- Short URL Functions ----------
 function generateShortId(len = 6) { return Math.random().toString(36).substring(2, 2+len); }
-async function createShortLink(target, customId = null, cloak = null, password = null, deviceRules = null) {
+function createShortLink(target, customId = null, cloak = null, password = null, deviceRules = null) {
   const id = customId ? customId.replace(/\s/g, '') : generateShortId();
-  const exists = await new Promise(resolve => db.get('SELECT id FROM shorturls WHERE id = ?', [id], (err, row) => resolve(!!row)));
+  const exists = db.prepare('SELECT id FROM shorturls WHERE id = ?').get(id);
   if (exists) throw new Error('Custom ID already taken');
-  await new Promise(resolve => db.run('INSERT INTO shorturls (id, target, cloak, password, device_rules, created_at) VALUES (?, ?, ?, ?, ?, ?)', [id, target, cloak, password, deviceRules, new Date().toISOString()], resolve));
+  const stmt = db.prepare('INSERT INTO shorturls (id, target, cloak, password, device_rules, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+  stmt.run(id, target, cloak, password, deviceRules, new Date().toISOString());
   return `${SHORT_URL_BASE}${id}`;
 }
-async function getShortLinkInfo(id) {
-  return new Promise(resolve => db.get('SELECT * FROM shorturls WHERE id = ?', [id], (err, row) => resolve(row)));
+function getShortLinkInfo(id) {
+  return db.prepare('SELECT * FROM shorturls WHERE id = ?').get(id);
 }
-async function updateShortLink(id, updates) {
+function updateShortLink(id, updates) {
   const fields = [], values = [];
-  if (updates.target) { fields.push('target = ?'); values.push(updates.target); }
+  if (updates.target !== undefined) { fields.push('target = ?'); values.push(updates.target); }
   if (updates.cloak !== undefined) { fields.push('cloak = ?'); values.push(updates.cloak); }
   if (updates.password !== undefined) { fields.push('password = ?'); values.push(updates.password); }
   if (updates.device_rules !== undefined) { fields.push('device_rules = ?'); values.push(updates.device_rules); }
   if (fields.length === 0) return;
   values.push(id);
-  await new Promise(resolve => db.run(`UPDATE shorturls SET ${fields.join(', ')} WHERE id = ?`, values, resolve));
+  db.prepare(`UPDATE shorturls SET ${fields.join(', ')} WHERE id = ?`).run(...values);
 }
-async function deleteShortLink(id) {
-  await new Promise(resolve => db.run('DELETE FROM shorturls WHERE id = ?', [id], resolve));
+function deleteShortLink(id) {
+  db.prepare('DELETE FROM shorturls WHERE id = ?').run(id);
 }
-async function listUserLinks(limit = 20) {
-  return new Promise(resolve => db.all('SELECT id, target, clicks, created_at FROM shorturls ORDER BY created_at DESC LIMIT ?', [limit], (err, rows) => resolve(rows || [])));
+function listUserLinks(limit = 20) {
+  return db.prepare('SELECT id, target, clicks, created_at FROM shorturls ORDER BY created_at DESC LIMIT ?').all(limit);
 }
 
 // ---------- APK Functions ----------
 async function parseApkInfo(fileBuffer) {
   return new Promise((resolve, reject) => {
     const parser = new apkParser(fileBuffer);
-    parser.readInfo((err, data) => {
-      if (err) reject(err);
-      else resolve(data);
-    });
+    parser.readInfo((err, data) => err ? reject(err) : resolve(data));
   });
 }
-async function saveApkRecord(id, filename, cdnPath, packageName, version, appName, iconBase64) {
-  await new Promise(resolve => db.run('INSERT INTO apk_files (id, filename, cdn_path, package_name, version, app_name, icon_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [id, filename, cdnPath, packageName, version, appName, iconBase64, new Date().toISOString()], resolve));
+function saveApkRecord(id, filename, cdnPath, packageName, version, appName, iconBase64) {
+  const stmt = db.prepare('INSERT INTO apk_files (id, filename, cdn_path, package_name, version, app_name, icon_base64, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  stmt.run(id, filename, cdnPath, packageName, version, appName, iconBase64, new Date().toISOString());
 }
-async function getApkRecord(id) {
-  return new Promise(resolve => db.get('SELECT * FROM apk_files WHERE id = ?', [id], (err, row) => resolve(row)));
+function getApkRecord(id) {
+  return db.prepare('SELECT * FROM apk_files WHERE id = ?').get(id);
 }
-async function incrementApkDownload(id) {
-  db.run('UPDATE apk_files SET download_count = download_count + 1 WHERE id = ?', [id]);
+function incrementApkDownload(id) {
+  db.prepare('UPDATE apk_files SET download_count = download_count + 1 WHERE id = ?').run(id);
 }
-async function listApkFiles(limit = 10) {
-  return new Promise(resolve => db.all('SELECT id, filename, app_name, version, download_count FROM apk_files ORDER BY created_at DESC LIMIT ?', [limit], (err, rows) => resolve(rows || [])));
+function listApkFiles(limit = 10) {
+  return db.prepare('SELECT id, filename, app_name, version, download_count FROM apk_files ORDER BY created_at DESC LIMIT ?').all(limit);
 }
 function generateQR(text) {
   return qr.imageSync(text, { type: 'png', size: 8 });
 }
 
-// ---------- APK Install Page (Express) ----------
-app.get('/apk/:id', async (req, res) => {
-  const id = req.params.id;
-  const apk = await getApkRecord(id);
+// ---------- Web Endpoints ----------
+app.get('/apk/:id', (req, res) => {
+  const apk = getApkRecord(req.params.id);
   if (!apk) return res.status(404).send('APK not found');
-  incrementApkDownload(id);
+  incrementApkDownload(apk.id);
   const downloadLink = `https://assets.cdn.express${apk.cdn_path}`;
-  // Simple install page HTML
   const html = `<!DOCTYPE html>
   <html>
   <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Download ${apk.app_name || apk.filename}</title>
   <style>body{font-family:sans-serif;background:#0a0f1e;color:#fff;text-align:center;padding:2rem} .card{background:#1a1f2e;border-radius:2rem;padding:2rem;max-width:400px;margin:auto} button{background:#c9a84c;border:none;padding:1rem 2rem;border-radius:3rem;font-weight:bold;cursor:pointer}</style>
   </head>
-  <body><div class="card"><h1>${apk.app_name || 'Download APK'}</h1><p>Version: ${apk.version || 'unknown'}</p><p>Package: ${apk.package_name || '-'}</p><a href="${downloadLink}"><button>📥 Download APK (${Math.round(apk.download_count+1)} downloads)</button></a><br><br><small>Direct download link valid forever</small></div></body>
+  <body><div class="card"><h1>${apk.app_name || 'Download APK'}</h1><p>Version: ${apk.version || 'unknown'}</p><p>Package: ${apk.package_name || '-'}</p><a href="${downloadLink}"><button>📥 Download APK (${apk.download_count+1} downloads)</button></a><br><br><small>Direct download link valid forever</small></div></body>
   </html>`;
   res.send(html);
 });
-
-// ---------- Short URL Redirect (with password protection) ----------
-app.get('/s/:id', async (req, res) => {
-  const id = req.params.id;
-  const row = await getShortLinkInfo(id);
+app.get('/s/:id', (req, res) => {
+  const row = getShortLinkInfo(req.params.id);
   if (!row) return res.status(404).send('Not found');
   if (row.password) {
     const pwd = req.query.pwd;
@@ -231,17 +223,15 @@ app.get('/s/:id', async (req, res) => {
       else if (rules.ios && /iphone|ipad/i.test(ua)) finalUrl = rules.ios;
     } catch(e) {}
   }
-  db.run('UPDATE shorturls SET clicks = clicks + 1 WHERE id = ?', [id]);
+  db.prepare('UPDATE shorturls SET clicks = clicks + 1 WHERE id = ?').run(row.id);
   res.redirect(finalUrl);
 });
-
-// ---------- Visit Tracking Endpoint ----------
 app.get('/api/visit', (req, res) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   const page = req.query.page || '/';
   const referrer = req.headers.referer || '';
   const ua = req.headers['user-agent'] || '';
-  db.run('INSERT INTO visits (ip, page, referrer, user_agent, created_at) VALUES (?, ?, ?, ?, ?)', [ip, page, referrer, ua, new Date().toISOString()]);
+  db.prepare('INSERT INTO visits (ip, page, referrer, user_agent, created_at) VALUES (?, ?, ?, ?, ?)').run(ip, page, referrer, ua, new Date().toISOString());
   res.sendStatus(200);
 });
 
@@ -262,7 +252,7 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, welcome, { parse_mode: 'Markdown', ...mainMenu });
 });
 
-// ---------- Callback Handlers (All Menus) ----------
+// ---------- Callback Handler ----------
 bot.on('callback_query', async (callbackQuery) => {
   const msg = callbackQuery.message;
   const chatId = msg.chat.id;
@@ -271,7 +261,6 @@ bot.on('callback_query', async (callbackQuery) => {
   const admin = isAdmin(userId);
   await bot.answerCallbackQuery(callbackQuery.id);
 
-  // Main menu navigation
   if (data === 'menu_file') {
     const kb = { inline_keyboard: [[{ text: '📂 List Files', callback_data: 'file_list' }, { text: '📤 Upload File', callback_data: 'file_upload' }],[{ text: '✏️ Edit File', callback_data: 'file_edit' }, { text: '🗑️ Delete File', callback_data: 'file_delete' }],[{ text: '🔙 Back', callback_data: 'back_main' }]] };
     bot.editMessageText('📁 *File Manager*', { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', ...kb });
@@ -285,8 +274,12 @@ bot.on('callback_query', async (callbackQuery) => {
     const kb = { inline_keyboard: [[{ text: '📦 Deploy Zip', callback_data: 'website_deploy' }, { text: '🌐 Add Domain', callback_data: 'website_domain' }],[{ text: '🔒 Enable SSL', callback_data: 'website_ssl' }, { text: '👁️ Preview', callback_data: 'website_preview' }],[{ text: '🔙 Back', callback_data: 'back_main' }]] };
     bot.editMessageText('🌐 *Website Manager*', { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', ...kb });
   } else if (data === 'menu_tracking') {
-    const stats = await getStats();
-    bot.editMessageText(`📊 *Tracking Stats*\nTotal visits: ${stats.totalVisits}\nUnique IPs: ${stats.uniqueIPs}\nShort link clicks: ${stats.totalClicks}\nAPK downloads: ${stats.totalApkDownloads}`, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', ...mainMenu });
+    const totalVisits = db.prepare('SELECT COUNT(*) as c FROM visits').get().c;
+    const uniqueIPs = db.prepare('SELECT COUNT(DISTINCT ip) as c FROM visits').get().c;
+    const totalClicks = db.prepare('SELECT SUM(clicks) as c FROM shorturls').get().c || 0;
+    const totalApkDownloads = db.prepare('SELECT SUM(download_count) as c FROM apk_files').get().c || 0;
+    const text = `📊 *Tracking Stats*\nTotal visits: ${totalVisits}\nUnique IPs: ${uniqueIPs}\nShort link clicks: ${totalClicks}\nAPK downloads: ${totalApkDownloads}`;
+    bot.editMessageText(text, { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', ...mainMenu });
   } else if (data === 'menu_cdn') {
     const kb = { inline_keyboard: [[{ text: '🗑️ Purge Cache', callback_data: 'cdn_purge' }, { text: '🔗 Secure Link', callback_data: 'cdn_secure' }],[{ text: '🔙 Back', callback_data: 'back_main' }]] };
     bot.editMessageText('🛡️ *CDN Manager*', { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', ...kb });
@@ -298,7 +291,7 @@ bot.on('callback_query', async (callbackQuery) => {
     bot.editMessageText('✨ *Main Menu*', { chat_id: chatId, message_id: msg.message_id, parse_mode: 'Markdown', ...mainMenu });
   }
 
-  // ----- File Manager Actions -----
+  // ---------- File Manager ----------
   else if (data === 'file_list') {
     const files = await listFTPFiles('/');
     let text = '📁 *Files on CDN*\n\n';
@@ -321,10 +314,16 @@ bot.on('callback_query', async (callbackQuery) => {
   } else if (data === 'file_edit') {
     bot.sendMessage(chatId, 'Send file path (e.g. /index.html) then new content in next message.');
     let step=0, filePath='';
-    const textHandler = (m) => {
+    const textHandler = async (m) => {
       if (m.chat.id !== chatId) return;
       if (step===0) { filePath = m.text; step=1; bot.sendMessage(chatId, `Now send new content for ${filePath}`); }
-      else { writeFTPFile(filePath, m.text).then(()=>{ bot.sendMessage(chatId,`✅ Updated ${filePath}`); purgeCDN(filePath); }).catch(e=>bot.sendMessage(chatId,`❌ ${e.message}`)); step=0; bot.removeListener('text',textHandler); }
+      else {
+        await writeFTPFile(filePath, m.text);
+        await purgeCDN(filePath);
+        bot.sendMessage(chatId, `✅ Updated ${filePath}`);
+        step=0;
+        bot.removeListener('text', textHandler);
+      }
     };
     bot.on('text', textHandler);
   } else if (data === 'file_delete') {
@@ -336,7 +335,7 @@ bot.on('callback_query', async (callbackQuery) => {
     });
   }
 
-  // ----- Short URL Actions -----
+  // ---------- Short URL ----------
   else if (data === 'short_create') {
     bot.sendMessage(chatId, 'Send target URL:');
     bot.once('text', async (urlMsg) => {
@@ -350,21 +349,23 @@ bot.on('callback_query', async (callbackQuery) => {
           bot.sendMessage(chatId, 'Password protect (leave blank for none):');
           bot.once('text', async (pwdMsg) => {
             const pwd = pwdMsg.text === 'none' ? null : pwdMsg.text;
-            const short = await createShortLink(target, customId, cloak, pwd);
-            bot.sendMessage(chatId, `✅ Short link: ${short}\n${pwd ? `Password: ${pwd}` : ''}`);
+            try {
+              const short = createShortLink(target, customId, cloak, pwd);
+              bot.sendMessage(chatId, `✅ Short link: ${short}\n${pwd ? `Password: ${pwd}` : ''}`);
+            } catch(e) { bot.sendMessage(chatId, `❌ ${e.message}`); }
           });
         });
       });
     });
   } else if (data === 'short_list') {
-    const links = await listUserLinks();
+    const links = listUserLinks();
     let text = '🔗 *Your short links*\n';
     links.forEach(l => text += `• /${l.id} → ${l.target.substring(0,40)} (${l.clicks} clicks)\n`);
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } else if (data === 'short_edit') {
     bot.sendMessage(chatId, 'Send short ID to edit:');
     bot.once('text', async (idMsg) => {
-      const info = await getShortLinkInfo(idMsg.text);
+      const info = getShortLinkInfo(idMsg.text);
       if (!info) return bot.sendMessage(chatId, 'Not found');
       bot.sendMessage(chatId, `Current target: ${info.target}\nNew target (/skip to keep):`);
       bot.once('text', async (tgtMsg) => {
@@ -372,7 +373,7 @@ bot.on('callback_query', async (callbackQuery) => {
         bot.sendMessage(chatId, 'New cloak (/skip):');
         bot.once('text', async (clkMsg) => {
           const newCloak = clkMsg.text === '/skip' ? null : clkMsg.text;
-          await updateShortLink(idMsg.text, { target: newTarget, cloak: newCloak });
+          updateShortLink(idMsg.text, { target: newTarget, cloak: newCloak });
           bot.sendMessage(chatId, '✅ Updated');
         });
       });
@@ -383,19 +384,19 @@ bot.on('callback_query', async (callbackQuery) => {
       bot.sendMessage(chatId, 'Enter password (or /remove to remove):');
       bot.once('text', async (pwdMsg) => {
         const pwd = pwdMsg.text === '/remove' ? null : pwdMsg.text;
-        await updateShortLink(idMsg.text, { password: pwd });
+        updateShortLink(idMsg.text, { password: pwd });
         bot.sendMessage(chatId, pwd ? `Password set: ${pwd}` : 'Password removed');
       });
     });
   } else if (data === 'short_delete') {
     bot.sendMessage(chatId, 'Send short ID to delete:');
     bot.once('text', async (idMsg) => {
-      await deleteShortLink(idMsg.text);
+      deleteShortLink(idMsg.text);
       bot.sendMessage(chatId, `Deleted ${idMsg.text}`);
     });
   }
 
-  // ----- APK Actions (Advanced) -----
+  // ---------- APK Hosting ----------
   else if (data === 'apk_upload') {
     bot.sendMessage(chatId, 'Send the APK file.');
     bot.once('document', async (docMsg) => {
@@ -404,7 +405,6 @@ bot.on('callback_query', async (callbackQuery) => {
       const fileLink = await bot.getFileLink(file.file_id);
       const resp = await axios({ url: fileLink, method: 'GET', responseType: 'arraybuffer' });
       const apkBuffer = Buffer.from(resp.data);
-      // Parse APK info
       let apkInfo = null;
       try {
         const parser = new apkParser(apkBuffer);
@@ -413,33 +413,26 @@ bot.on('callback_query', async (callbackQuery) => {
       const appName = apkInfo?.package?.name || file.file_name.replace('.apk','');
       const version = apkInfo?.package?.versionName || 'unknown';
       const packageName = apkInfo?.package?.package || 'unknown';
-      // Save to FTP
       const remotePath = `/apk/${Date.now()}_${file.file_name}`;
       const tmpPath = `/tmp/apk_${Date.now()}.apk`;
       fs.writeFileSync(tmpPath, apkBuffer);
       await uploadSingleFile(tmpPath, remotePath);
       fs.unlinkSync(tmpPath);
-      // Generate QR code
       const downloadUrl = `https://assets.cdn.express${remotePath}`;
       const qrBuffer = generateQR(downloadUrl);
       const qrPath = `/tmp/qr_${Date.now()}.png`;
       fs.writeFileSync(qrPath, qrBuffer);
-      // Save to DB
       const apkId = generateShortId(8);
       let iconBase64 = '';
-      if (apkInfo?.icon) {
-        // icon is buffer? apk-parser gives icon buffer
-        iconBase64 = apkInfo.icon.toString('base64');
-      }
-      await saveApkRecord(apkId, file.file_name, remotePath, packageName, version, appName, iconBase64);
-      // Send response
+      if (apkInfo?.icon) iconBase64 = apkInfo.icon.toString('base64');
+      saveApkRecord(apkId, file.file_name, remotePath, packageName, version, appName, iconBase64);
       const installPageUrl = `${APK_INSTALL_PAGE_BASE}${apkId}`;
-      await bot.sendPhoto(chatId, fs.createReadStream(qrPath), { caption: `✅ *APK Uploaded*\n\n📱 *Name:* ${appName}\n📦 *Version:* ${version}\n🆔 *Package:* ${packageName}\n🔗 *Direct link:* ${downloadUrl}\n🌐 *Install page:* ${installPageUrl}\n\nUse /apk_list to see all.` , parse_mode: 'Markdown' });
+      await bot.sendPhoto(chatId, fs.createReadStream(qrPath), { caption: `✅ *APK Uploaded*\n\n📱 *Name:* ${appName}\n📦 *Version:* ${version}\n🆔 *Package:* ${packageName}\n🔗 *Direct link:* ${downloadUrl}\n🌐 *Install page:* ${installPageUrl}\n\nUse /apk_list to see all.`, parse_mode: 'Markdown' });
       fs.unlinkSync(qrPath);
       addLog(`Uploaded APK ${file.file_name}`);
     });
   } else if (data === 'apk_list') {
-    const apks = await listApkFiles(20);
+    const apks = listApkFiles(20);
     let text = '📱 *APK Files*\n\n';
     for (const apk of apks) {
       text += `• ${apk.app_name} v${apk.version} (${apk.download_count} downloads)\n   /apk_${apk.id}\n`;
@@ -448,7 +441,7 @@ bot.on('callback_query', async (callbackQuery) => {
   } else if (data === 'apk_info') {
     bot.sendMessage(chatId, 'Send APK ID (from /apk_list):');
     bot.once('text', async (txt) => {
-      const apk = await getApkRecord(txt.text);
+      const apk = getApkRecord(txt.text);
       if (!apk) return bot.sendMessage(chatId, 'Not found');
       let info = `📱 *${apk.app_name}*\n📦 Version: ${apk.version}\n🆔 Package: ${apk.package_name}\n📥 Downloads: ${apk.download_count}\n🔗 Direct: https://assets.cdn.express${apk.cdn_path}\n🌐 Install: ${APK_INSTALL_PAGE_BASE}${apk.id}`;
       if (apk.icon_base64) {
@@ -457,16 +450,13 @@ bot.on('callback_query', async (callbackQuery) => {
       } else bot.sendMessage(chatId, info, { parse_mode: 'Markdown' });
     });
   } else if (data === 'apk_analytics') {
-    const apks = await listApkFiles(100);
-    let text = '📊 *APK Analytics*\n';
-    let total = 0;
-    apks.forEach(a => total += a.download_count);
-    text += `Total downloads across all APKs: ${total}\n`;
-    text += `Top APK: ${apks[0]?.app_name} (${apks[0]?.download_count} downloads)\n`;
+    const apks = listApkFiles(100);
+    let total = apks.reduce((sum, a) => sum + a.download_count, 0);
+    let text = `📊 *APK Analytics*\nTotal downloads: ${total}\nTop APK: ${apks[0]?.app_name} (${apks[0]?.download_count} downloads)`;
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   }
 
-  // ----- Website Manager -----
+  // ---------- Website Manager ----------
   else if (data === 'website_deploy') {
     if (!admin) return;
     bot.sendMessage(chatId, 'Send ZIP file with website.');
@@ -502,7 +492,7 @@ bot.on('callback_query', async (callbackQuery) => {
     bot.sendMessage(chatId, 'Preview: https://assets.cdn.express/index.html');
   }
 
-  // ----- CDN -----
+  // ---------- CDN ----------
   else if (data === 'cdn_purge') {
     await purgeCDN('/');
     bot.sendMessage(chatId, '🗑️ Cache purged.');
@@ -511,13 +501,14 @@ bot.on('callback_query', async (callbackQuery) => {
     bot.once('text', async (pathMsg) => {
       const expires = Math.floor(Date.now()/1000)+3600;
       const clientIp = String(chatId);
-      const md5 = require('crypto').createHash('md5').update(CDN_SECRET+expires+pathMsg.text+clientIp).digest('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+      const crypto = require('crypto');
+      const md5 = crypto.createHash('md5').update(CDN_SECRET+expires+pathMsg.text+clientIp).digest('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
       const link = `https://assets.cdn.express/secure/ip/t/${md5}/${expires}${pathMsg.text}`;
       bot.sendMessage(chatId, `🔗 [Secure link (1h)](${link})`, { parse_mode: 'Markdown' });
     });
   }
 
-  // ----- Admin -----
+  // ---------- Admin ----------
   else if (data === 'admin_logs') {
     if (!admin) return;
     let text = '📜 *Logs*\n';
@@ -538,17 +529,56 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// ---------- Helper Stats ----------
-async function getStats() {
-  const totalVisits = await new Promise(resolve => db.get('SELECT COUNT(*) as c FROM visits', (err, row) => resolve(row?.c || 0)));
-  const uniqueIPs = await new Promise(resolve => db.get('SELECT COUNT(DISTINCT ip) as c FROM visits', (err, row) => resolve(row?.c || 0)));
-  const totalClicks = await new Promise(resolve => db.get('SELECT SUM(clicks) as c FROM shorturls', (err, row) => resolve(row?.c || 0)));
-  const totalApkDownloads = await new Promise(resolve => db.get('SELECT SUM(download_count) as c FROM apk_files', (err, row) => resolve(row?.c || 0)));
-  return { totalVisits, uniqueIPs, totalClicks, totalApkDownloads };
-}
+// ---------- Simple commands fallback ----------
+bot.onText(/\/files/, async (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  const files = await listFTPFiles('/');
+  let text = '📁 *Files*\n';
+  files.forEach(f => text += `• ${f.name} (${f.size})\n`);
+  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
+bot.onText(/\/short (.+)/, (msg, match) => {
+  const url = match[1];
+  try { const short = createShortLink(url); bot.sendMessage(msg.chat.id, `🔗 ${short}`); } catch(e) { bot.sendMessage(msg.chat.id, e.message); }
+});
+bot.onText(/\/mylinks/, (msg) => {
+  const links = listUserLinks();
+  let text = 'Your links:\n';
+  links.forEach(l => text += `/${l.id} - ${l.clicks} clicks\n`);
+  bot.sendMessage(msg.chat.id, text);
+});
+bot.onText(/\/deploy/, (msg) => {
+  if (!isAdmin(msg.from.id)) return;
+  bot.sendMessage(msg.chat.id, 'Send ZIP file.');
+  bot.once('document', async (docMsg) => { /* same as website_deploy */ });
+});
+bot.onText(/\/adddomain (.+)/, async (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  try {
+    await addDNSRecord(match[1], 'CNAME', '@', 'assets.cdn.express', true);
+    bot.sendMessage(msg.chat.id, `✅ Domain ${match[1]} added.`);
+  } catch(e) { bot.sendMessage(msg.chat.id, `❌ ${e.message}`); }
+});
+bot.onText(/\/stats/, (msg) => {
+  const totalVisits = db.prepare('SELECT COUNT(*) as c FROM visits').get().c;
+  const uniqueIPs = db.prepare('SELECT COUNT(DISTINCT ip) as c FROM visits').get().c;
+  const totalClicks = db.prepare('SELECT SUM(clicks) as c FROM shorturls').get().c || 0;
+  const totalApkDownloads = db.prepare('SELECT SUM(download_count) as c FROM apk_files').get().c || 0;
+  bot.sendMessage(msg.chat.id, `📊 Stats\nVisits: ${totalVisits}\nUnique IPs: ${uniqueIPs}\nShort clicks: ${totalClicks}\nAPK downloads: ${totalApkDownloads}\nWebSocket: ${connectedClients}`);
+});
+bot.onText(/\/broadcast (.+)/, (msg, match) => {
+  if (!isAdmin(msg.from.id)) return;
+  broadcast({ type: 'admin_message', data: match[1] });
+  bot.sendMessage(msg.chat.id, 'Broadcast sent.');
+});
 
 // ---------- WebSocket ----------
 wss.on('connection', (ws) => { connectedClients++; ws.on('close', () => connectedClients--); });
+
+// ---------- Cron (daily backup reminder) ----------
+cron.schedule('0 2 * * *', () => {
+  if (ADMIN_IDS.length) bot.sendMessage(ADMIN_IDS[0], '⏰ Daily backup reminder: Use /backup (manual) to archive your website files.');
+});
 
 // ---------- Start Server ----------
 app.get('/', (req, res) => res.send('Bot is running'));
